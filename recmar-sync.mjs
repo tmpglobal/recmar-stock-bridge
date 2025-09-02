@@ -1,4 +1,8 @@
 // recmar-sync.mjs — RecMar → Shopify bulk inventory sync (GraphQL)
+// - DEDUPES by inventory_item_id so batches never include duplicates
+// - AUTO-CONNECTS any “not stocked at location” items and retries them
+// - Supports optional sku-map.csv (feed_sku,shopify_sku)
+// - Writes CSV reports to ./out
 
 ////////////////////////////////////////////////////////////////////////////////
 // 1) Preflight
@@ -50,7 +54,7 @@ function writeCsv(file, rows, header){
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// 3) Shopify helpers
+// 3) Shopify helpers (GraphQL + small REST for connect)
 ////////////////////////////////////////////////////////////////////////////////
 async function gql(query, variables = {}) {
   const res = await fetch(`${ADMIN_BASE}/graphql.json`, {
@@ -65,7 +69,6 @@ async function gql(query, variables = {}) {
 
 async function resolveLocationId() {
   if (SHOPIFY_LOCATION_ID) return SHOPIFY_LOCATION_ID;
-  // Fetch locations via REST (simpler than GraphQL for names)
   const res = await fetch(`${ADMIN_BASE}/locations.json`, {
     headers: { 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN }
   });
@@ -106,8 +109,21 @@ async function fetchAllVariantSkuToInvItem() {
   return { exact, normalized };
 }
 
+async function connectInventory(invId, locationId) {
+  const res = await fetch(`${ADMIN_BASE}/inventory_levels/connect.json`, {
+    method: 'POST',
+    headers: { 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ inventory_item_id: Number(invId), location_id: Number(locationId) })
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    // 422 often means "already connected" — ignore
+    if (!/422/.test(String(res.status))) throw new Error(`connect failed: ${res.status} ${txt}`);
+  }
+}
+
 ////////////////////////////////////////////////////////////////////////////////
-// 4) Read RecMar CSV (created by the workflow step into /tmp/recmar.csv)
+// 4) Read RecMar numeric CSV from /tmp (created by workflow step)
 ////////////////////////////////////////////////////////////////////////////////
 function parseCsvNumeric(filePath) {
   const txt = fs.readFileSync(filePath, 'utf8').trim();
@@ -120,8 +136,8 @@ function parseCsvNumeric(filePath) {
   const map = new Map();
   for (let i=1;i<lines.length;i++){
     const row = lines[i].split(',');
-    if (!row[iSku]) continue;
-    const sku = row[iSku].trim();
+    const sku = (row[iSku] || '').trim();
+    if (!sku) continue;
     const q = Number(row[iQty] ?? '0');
     if (Number.isNaN(q)) continue;
     map.set(sku, q);
@@ -130,7 +146,7 @@ function parseCsvNumeric(filePath) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// 5) Optional SKU map support (sku-map.csv with header: feed_sku,shopify_sku)
+// 5) Optional SKU map (sku-map.csv with header: feed_sku,shopify_sku)
 ////////////////////////////////////////////////////////////////////////////////
 function loadSkuMap() {
   try {
@@ -138,16 +154,15 @@ function loadSkuMap() {
     if (!fs.existsSync(p)) { console.log('sku-map.csv not found (optional)'); return new Map(); }
     const text = fs.readFileSync(p, 'utf8').trim();
     const lines = text.split(/\r?\n/).filter(l => l.trim() && !l.trim().startsWith('#'));
-    let iFeed = 0, iShop = 1;
-    const first = lines[0].split(',');
-    if (/feed_sku/i.test(first[0]) && /shopify_sku/i.test(first[1])) lines.shift();
+    // skip header if present
+    if (/feed_sku/i.test(lines[0]) && /shopify_sku/i.test(lines[0])) lines.shift();
     const map = new Map();
     for (const line of lines) {
-      const parts = line.split(',');
-      if (parts.length < 2) continue;
-      const feed = parts[iFeed].trim().replace(/^"|"$/g,'');
-      const shop = parts[iShop].trim().replace(/^"|"$/g,'');
-      if (feed && shop) map.set(feed, shop);
+      const [feed, shop] = line.split(',');
+      if (!feed || !shop) continue;
+      const f = feed.trim().replace(/^"|"$/g,'');
+      const s = shop.trim().replace(/^"|"$/g,'');
+      if (f && s) map.set(f, s);
     }
     console.log(`Loaded sku-map.csv entries: ${map.size}`);
     return map;
@@ -158,7 +173,7 @@ function loadSkuMap() {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// 6) Bulk writer: inventorySetQuantities
+// 6) GraphQL bulk writer
 ////////////////////////////////////////////////////////////////////////////////
 const INV_SET_MUT = `
 mutation InventorySet($input: InventorySetQuantitiesInput!) {
@@ -171,7 +186,6 @@ mutation InventorySet($input: InventorySetQuantitiesInput!) {
 // 7) Main
 ////////////////////////////////////////////////////////////////////////////////
 (async () => {
-  // Read numeric CSV produced by the workflow step
   const CSV_PATH = '/tmp/recmar.csv';
   if (!fs.existsSync(CSV_PATH)) {
     console.error(`❌ Expected ${CSV_PATH} to exist. Make sure the workflow step ran.`);
@@ -184,9 +198,9 @@ mutation InventorySet($input: InventorySetQuantitiesInput!) {
   const location_id = await resolveLocationId();
   const mode = (SKU_MATCH_MODE || 'normalize').toLowerCase();
 
-  // Build matches
+  // Build matches (exact → mapped → normalized-unique)
   const skuMap = loadSkuMap();
-  const intersect = []; // { sku, invId, qty }
+  const candidates = []; // { sku, inventory_item_id, qty }
   const misses = [];
   const ambiguous = [];
   let matchedExact=0, matchedMapped=0, matchedNormalized=0;
@@ -222,15 +236,18 @@ mutation InventorySet($input: InventorySetQuantitiesInput!) {
       misses.push({ sku: feedSku, mapped_to: skuMap.get(feedSku) || '', reason:'not_in_shopify' });
       continue;
     }
-    intersect.push({ sku: targetSku, inventory_item_id: invId, qty: Number(qty) });
+    candidates.push({ sku: targetSku, inventory_item_id: String(invId), qty: Number(qty) });
   }
 
-  // Decide work set
-  let work = intersect;
-  const BATCH = Math.max(1, Number(GQL_BATCH) || 100);
+  // DEDUPE by inventory_item_id (last write wins)
+  const byInv = new Map();
+  for (const x of candidates) byInv.set(x.inventory_item_id, x);
+  let work = Array.from(byInv.values());
 
+  // Scope of work
+  const BATCH = Math.max(1, Number(GQL_BATCH) || 100);
   if (String(FULL_SWEEP).toLowerCase() !== 'true') {
-    work = work.slice(0, 1500); // defensive cap (can raise)
+    work = work.slice(0, 1500); // safety if you ever switch off full sweep
   } else {
     console.log('FULL_SWEEP is ON — processing ALL matched SKUs (GraphQL bulk).');
   }
@@ -239,10 +256,11 @@ mutation InventorySet($input: InventorySetQuantitiesInput!) {
   console.log(`Matched: exact=${matchedExact}, mapped=${matchedMapped}, normalized=${matchedNormalized}, ambiguous=${ambiguous.length}, misses=${misses.length}`);
   console.log(`Processing this run: ${work.length} (gql_batch=${BATCH})`);
 
-  // Bulk write
   let updated=0, errors=0;
   const changedRows = [];
+  const notStockedSet = new Set(); // inventory_item_id to activate
 
+  // PASS 1 — set quantities
   for (let i=0; i<work.length; i+=BATCH) {
     const chunk = work.slice(i, i+BATCH);
     const input = {
@@ -260,10 +278,18 @@ mutation InventorySet($input: InventorySetQuantitiesInput!) {
       const data = await gql(INV_SET_MUT, { input });
       const ue = data?.inventorySetQuantities?.userErrors || [];
       if (ue.length) {
+        // Collect “not stocked at the location” items to activate
+        for (const e of ue) {
+          const msg = String(e.message || '');
+          const idx = Number(e.field?.[2] ?? -1);
+          if (/not stocked at the location/i.test(msg) && idx >= 0 && idx < chunk.length) {
+            notStockedSet.add(chunk[idx].inventory_item_id);
+          }
+        }
         errors += ue.length;
         console.error('GraphQL userErrors (sample):', ue.slice(0,5));
       }
-      const ok = Math.max(0, chunk.length - (data?.inventorySetQuantities?.userErrors?.length || 0));
+      const ok = Math.max(0, chunk.length - ue.length);
       updated += ok;
       for (const x of chunk.slice(0, ok)) changedRows.push({ sku: x.sku, inventory_item_id: x.inventory_item_id, to: x.qty });
       await wait(150);
@@ -271,6 +297,48 @@ mutation InventorySet($input: InventorySetQuantitiesInput!) {
       errors += chunk.length;
       console.error(`GQL batch failed (${i}-${i+BATCH}): ${e.message}`);
       await wait(800);
+    }
+  }
+
+  // If some items weren’t stocked, CONNECT them and RETRY just those
+  if (notStockedSet.size) {
+    console.log(`Activating ${notStockedSet.size} inventory items at location ${location_id}…`);
+    for (const invId of notStockedSet) {
+      try { await connectInventory(invId, location_id); await wait(120); }
+      catch (e) { console.warn(`connect failed for ${invId}: ${e.message}`); }
+    }
+
+    // Retry setQuantities only for the activated ones
+    const retry = work.filter(x => notStockedSet.has(x.inventory_item_id));
+    for (let i=0; i<retry.length; i+=BATCH) {
+      const chunk = retry.slice(i, i+BATCH);
+      const input = {
+        name: 'available',
+        reason: 'correction',
+        referenceDocumentUri: 'workhorse://recmar/sync',
+        ignoreCompareQuantity: true,
+        quantities: chunk.map(x => ({
+          inventoryItemId: invGid(x.inventory_item_id),
+          locationId: locGid(location_id),
+          quantity: Number(x.qty)
+        }))
+      };
+      try {
+        const data = await gql(INV_SET_MUT, { input });
+        const ue = data?.inventorySetQuantities?.userErrors || [];
+        if (ue.length) {
+          errors += ue.length;
+          console.error('Retry userErrors (sample):', ue.slice(0,5));
+        }
+        const ok = Math.max(0, chunk.length - ue.length);
+        updated += ok;
+        for (const x of chunk.slice(0, ok)) changedRows.push({ sku: x.sku, inventory_item_id: x.inventory_item_id, to: x.qty });
+        await wait(150);
+      } catch(e) {
+        errors += chunk.length;
+        console.error(`Retry GQL batch failed (${i}-${i+BATCH}): ${e.message}`);
+        await wait(800);
+      }
     }
   }
 
@@ -291,7 +359,6 @@ mutation InventorySet($input: InventorySetQuantitiesInput!) {
   };
   console.log(summary);
 
-  // Reports
   if (String(REPORT_CSV).toLowerCase() === 'true') {
     writeCsv('changes.csv', changedRows, ['sku','inventory_item_id','to']);
     writeCsv('misses.csv', misses, ['sku','mapped_to','reason']);
