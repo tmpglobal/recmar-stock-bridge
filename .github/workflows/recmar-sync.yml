@@ -1,0 +1,84 @@
+name: RecMar → Shopify Sync
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # hourly
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Pull hourly RecMar file via FTP and convert to numeric CSV
+      - name: Fetch & convert RecMar tab file → numeric CSV
+        env:
+          FTP_USER: ${{ secrets.RECMAR_FTP_USER }}
+          FTP_PASS: ${{ secrets.RECMAR_FTP_PASS }}
+          FTP_PATH: ${{ vars.RECMAR_FTP_PATH }}
+          MAP_HIGH:   ${{ vars.MAP_HIGH }}
+          MAP_MIDDLE: ${{ vars.MAP_MIDDLE }}
+          MAP_LOW:    ${{ vars.MAP_LOW }}
+          MAP_NA:     ${{ vars.MAP_NA }}
+        run: |
+          set -e
+          : "${FTP_PATH:=/stock-level.csv}"
+          : "${MAP_HIGH:=12}"; : "${MAP_MIDDLE:=5}"; : "${MAP_LOW:=2}"; : "${MAP_NA:=0}"
+
+          echo "Downloading ftp://files.recambiosmarinos.com${FTP_PATH}"
+          curl -sS --disable-epsv --ftp-method nocwd -u "${FTP_USER}:${FTP_PASS}" \
+            "ftp://files.recambiosmarinos.com${FTP_PATH}" -o /tmp/recmar_raw.txt
+
+          # Normalize CRLF, detect TAB separator
+          sed -e 's/\r$//' /tmp/recmar_raw.txt > /tmp/recmar_lf.txt
+          if grep -q $'\t' /tmp/recmar_lf.txt; then SEP=$'\t'; else SEP='[[:space:]]+'; fi
+
+          # Create /tmp/recmar.csv with header SKU,Quantity and numeric quantities
+          awk -v FS="$SEP" 'BEGIN{OFS=","; print "SKU,QuantityWord"}
+               NF>=1 { sku=$1; word=(NF>=2?$2:""); gsub(/"/,"",sku); gsub(/"/,"",word); print sku,word }
+          ' /tmp/recmar_lf.txt > /tmp/recmar_words.csv
+
+          awk -F',' -v OFS=',' \
+              -v H="${MAP_HIGH}" -v M="${MAP_MIDDLE}" -v L="${MAP_LOW}" -v Z="${MAP_NA}" '
+            NR==1 { print "SKU","Quantity"; next }
+            { q=toupper($2); qty=(q=="HIGH"?H:(q=="MIDDLE"||q=="MEDIUM"?M:(q=="LOW"?L:Z))); print $1, qty+0 }
+          ' /tmp/recmar_words.csv > /tmp/recmar.csv
+
+          echo "Preview:"
+          head -n 10 /tmp/recmar.csv || true
+
+      - name: Show head/tail of sync script (debug)
+        run: |
+          sed -n '1,60p' recmar-sync.mjs | nl -ba
+          echo "----"
+          tail -n 40 recmar-sync.mjs | nl -ba
+
+      - name: Run RecMar sync
+        run: node recmar-sync.mjs
+        env:
+          # Shopify
+          SHOPIFY_ADMIN_TOKEN: ${{ secrets.SHOPIFY_ADMIN_TOKEN }}
+          SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_API_VERSION: '2025-07'
+          SHOPIFY_LOCATION_ID: ${{ secrets.SHOPIFY_LOCATION_ID }}
+          SHOPIFY_LOCATION_NAME: ${{ secrets.SHOPIFY_LOCATION_NAME }}
+
+          # Controls
+          FULL_SWEEP: ${{ vars.FULL_SWEEP }}
+          SKU_MATCH_MODE: ${{ vars.SKU_MATCH_MODE }}
+          GQL_BATCH: ${{ vars.GQL_BATCH }}
+
+      - name: Upload report CSVs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recmar-sync-report
+          path: out/*.csv
+          if-no-files-found: ignore
